@@ -37,7 +37,13 @@ class LedgerEntry(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [models.Index(fields=["account", "created_at"])]
+        indexes = [
+            models.Index(fields=["account", "created_at"]),
+            # Covers the cross-account transaction search endpoint: filter by
+            # type, order by created_at. Added after measuring the query
+            # without it under 2M rows, documented in README under "Scale, for real".
+            models.Index(fields=["type", "-created_at"], name="ledger_entry_type_created_idx"),
+        ]
 
 
 class IdempotencyKey(models.Model):

@@ -14,12 +14,25 @@ Live: [reconcile-desk.vercel.app](https://reconcile-desk.vercel.app) (frontend) 
 
 - **Backend**: Django 6, Django REST Framework, PostgreSQL (psycopg3), gunicorn
 - **Frontend**: React 19, TypeScript, Vite, Axios
-- **Tests**: pytest + pytest-django (9 tests, including a real concurrency test against Postgres, not sqlite), Vitest + Testing Library (3 tests)
+- **Tests**: pytest + pytest-django (11 tests, including a real concurrency test against Postgres, not sqlite), Vitest + Testing Library (3 tests)
+- **Load testing**: k6, against a real 2M-row seeded dataset
 - **CI**: GitHub Actions, backend tests run against a real `postgres:16-alpine` service container
 
 ## Concurrency, for real
 
 `ledger/tests/test_concurrency.py` fires 15 threads at a single account funded for exactly one transfer, each on its own DB connection, and asserts exactly one succeeds and the balance never goes negative. It runs against real Postgres via `TransactionTestCase`, not an in-memory sqlite connection that would mask the row-locking behavior entirely.
+
+## Scale, for real
+
+`python manage.py seed_benchmark` loads a synthetic dataset (default: 5,000 accounts, 2,000,000 ledger entries) via a single set-based `INSERT ... SELECT generate_series(...)`, not a Python loop building 2 million ORM objects. On this machine it seeds 2M rows in about a minute.
+
+`/api/transactions/search/` is a cross-account search by type and date range, the kind of query an ops/reporting screen runs constantly. Measured against the seeded dataset:
+
+- **Without a supporting index**: 1,362ms per query (`EXPLAIN ANALYZE`, full index scan on `(account, created_at)` then filtering 54,740 rows by hand to find the 50 that matched).
+- **With a composite index on `(type, -created_at)`**: 3.9ms. A ~350x improvement from one migration.
+- **Load test** (`scripts/load_test.js`, k6, against gunicorn with `--workers 9 --threads 4 --worker-class gthread`, not `manage.py runserver`, which is single-threaded and would measure Django's dev server rather than the application): **~1,000 requests/second sustained, p95 under 200ms, zero failed requests**, against the full 2M-row dataset. Pushed further to a 1,500–3,000 req/s target, latency rose but the failure rate stayed at 0%: the system slows down under genuine overload rather than falling over. Measured on a single 10-core machine running both the load generator and the server at once, so the two were competing for the same CPU; dedicated hardware would likely do better.
+
+The index alone wasn't the fix. The first load test, index already in place, topped out around 96 req/s with 13% failures. The bottleneck was gunicorn's default `sync` worker class, which handles one request at a time per process and has no way to overlap the wait on Postgres I/O. Switching to `gthread` got further but still stalled under 120 req/s until the real second bottleneck was found: Django's `Paginator` calls `.count()` to know the total page count, which scans every matching row even with a covering index. Replacing it with a fetch-`page_size + 1`-rows check, a plain `has_next` without a count, was what actually unlocked the throughput above.
 
 ## Running it
 
@@ -33,6 +46,11 @@ export DATABASE_URL="postgres://reconcile:reconcile@localhost:5435/reconcile_des
 python manage.py migrate
 python manage.py runserver 8234
 python -m pytest                      # run tests
+
+# Scale benchmark (optional)
+python manage.py seed_benchmark         # 5,000 accounts, 2M ledger entries
+gunicorn config.wsgi:application --bind 127.0.0.1:8234 --workers 9 --threads 4 --worker-class gthread
+cd .. && BASE_URL=http://127.0.0.1:8234 k6 run scripts/load_test.js
 
 # Frontend
 cd frontend
@@ -50,4 +68,4 @@ npm test
 
 ## What's not here
 
-No authentication/authorization layer (every endpoint is open; this is a focused concurrency/reconciliation demo, not a deployable product), no pagination on the accounts/statements endpoints, no real bank/processor integration (the reconciliation CSV format is a plausible but invented schema, stated plainly rather than implied to be a real provider's format).
+No authentication/authorization layer (every endpoint is open; this is a focused concurrency/reconciliation/scale demo, not a deployable product), no pagination on the accounts/statements list endpoints specifically (only transaction search, where it actually matters at scale), no real bank/processor integration (the reconciliation CSV format is a plausible but invented schema, stated plainly rather than implied to be a real provider's format).
